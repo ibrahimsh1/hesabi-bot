@@ -25,7 +25,6 @@ def save(d):
     c.close()
 
 def has_number(msg):
-    """Check if message contains a number"""
     return bool(re.search(r'\d+', msg))
 
 async def start(u, c):
@@ -87,13 +86,12 @@ async def report(u, c):
 
 async def process(u, c):
     msg = u.message.text.strip()
+    today = datetime.now().strftime("%Y-%m-%d")
     
-    # رسائل قصيرة جداً
     if len(msg) < 3:
         await u.message.reply_text("ارسل وصف اوضح مثل: قهوة 18")
         return
     
-    # رسائل بدون ارقام = مو معاملة
     if not has_number(msg):
         await u.message.reply_text(
             "ما حسبت هذه معاملة لانها بدون مبلغ\n\n"
@@ -109,7 +107,10 @@ async def process(u, c):
         r = ai.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
-            system='''You are a Saudi personal finance assistant. The user sends transactions in Arabic.
+            system=f'''You are a Saudi personal finance assistant. The user sends transactions in Arabic.
+
+TODAY'S DATE IS: {today}
+Always use this exact date in the response.
 
 Rules:
 1. If the message is clearly a financial transaction with amount, extract it.
@@ -119,28 +120,26 @@ Rules:
 Reply ONLY with valid JSON in one of these formats:
 
 For valid transaction:
-{"date":"YYYY-MM-DD","description":"وصف بالعربي","category":"الفئة بالعربي","type":"income or fixed_expense or variable_expense or saving","amount":number}
+{{"date":"{today}","description":"وصف بالعربي","category":"الفئة بالعربي","type":"income or fixed_expense or variable_expense or saving","amount":number}}
 
 For unclear/missing info:
-{"needs_clarification":true,"reason":"reason in arabic"}
+{{"needs_clarification":true,"reason":"reason in arabic"}}
 
 For non-transaction:
-{"not_transaction":true,"reply":"polite reply in arabic"}
+{{"not_transaction":true,"reply":"polite reply in arabic"}}
 
 Categories (use one): راتب, دخل اضافي, ايجار, فواتير, اشتراكات, طعام وشراب, مواصلات, تسوق, ترفيه, صحة, تعليم, ادخار, متفرقات
 
-Use today date. Be smart about Arabic descriptions.''',
+Be smart about Arabic descriptions.''',
             messages=[{"role": "user", "content": msg}]
         )
         raw = r.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         d = json.loads(raw)
         
-        # رسالة مو معاملة
         if d.get("not_transaction"):
             await u.message.reply_text(d.get("reply", "هذي مو معاملة مالية"))
             return
         
-        # تحتاج توضيح
         if d.get("needs_clarification"):
             await u.message.reply_text(
                 f"محتاج توضيح: {d.get('reason', 'الرسالة غير واضحة')}\n\n"
@@ -148,8 +147,10 @@ Use today date. Be smart about Arabic descriptions.''',
             )
             return
         
-        # معاملة صحيحة
+        # Force today's date regardless of what AI returns
+        d["date"] = today
         save(d)
+        
         type_ar = {
             "income": "دخل",
             "fixed_expense": "مصروف ثابت",
@@ -169,7 +170,7 @@ Use today date. Be smart about Arabic descriptions.''',
     except json.JSONDecodeError:
         await u.message.reply_text("ما قدرت اقرا الرد، حاول بصيغة اوضح\nمثال: قهوة 18")
     except Exception as e:
-        await u.message.reply_text(f"خطا تقني، حاول مرة ثانية")
+        await u.message.reply_text("خطا تقني، حاول مرة ثانية")
         print(f"Error: {e}")
 
 def main():

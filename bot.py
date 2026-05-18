@@ -3,6 +3,7 @@ Hesabi Bot - Full Personal Accounting System
 - Double-entry bookkeeping
 - Assets, Liabilities, Equity, Income, Expenses
 - Balance Sheet, Income Statement, Cash Flow
+- Opening balances, Delete, Reset
 """
 import anthropic
 import json
@@ -21,14 +22,12 @@ ai = anthropic.Anthropic(api_key=KEY)
 # ============== DATABASE ==============
 def init():
     c = sqlite3.connect(DB)
-    # Accounts (chart of accounts)
     c.execute("""CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
         type TEXT,
         active INTEGER DEFAULT 1
     )""")
-    # Journal entries (double-entry)
     c.execute("""CREATE TABLE IF NOT EXISTS journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
@@ -37,27 +36,21 @@ def init():
         credit_account TEXT,
         amount REAL
     )""")
-    # Insert default accounts if empty
     count = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
     if count == 0:
         defaults = [
-            # Assets
             ("نقد", "asset"),
             ("بنك", "asset"),
             ("استثمارات", "asset"),
             ("ذهب", "asset"),
             ("عقار", "asset"),
             ("سيارة", "asset"),
-            # Liabilities
             ("قرض", "liability"),
             ("بطاقة ائتمان", "liability"),
-            # Equity
             ("رأس المال", "equity"),
-            # Income
             ("راتب", "income"),
             ("دخل اضافي", "income"),
             ("ارباح استثمار", "income"),
-            # Expenses
             ("طعام وشراب", "expense"),
             ("مواصلات", "expense"),
             ("ايجار", "expense"),
@@ -80,8 +73,10 @@ def post_entry(date, desc, debit_acc, credit_acc, amount):
         "INSERT INTO journal (date, description, debit_account, credit_account, amount) VALUES (?, ?, ?, ?, ?)",
         (date, desc, debit_acc, credit_acc, amount)
     )
+    last_id = c.lastrowid
     c.commit()
     c.close()
+    return last_id
 
 
 def get_accounts():
@@ -91,21 +86,23 @@ def get_accounts():
     return rows
 
 
+def account_exists(name):
+    c = sqlite3.connect(DB)
+    r = c.execute("SELECT type FROM accounts WHERE name=?", (name,)).fetchone()
+    c.close()
+    return r[0] if r else None
+
+
 def get_balance(account):
-    """Get account balance based on type"""
     c = sqlite3.connect(DB)
     acc_type = c.execute("SELECT type FROM accounts WHERE name=?", (account,)).fetchone()
     if not acc_type:
         c.close()
         return 0
     acc_type = acc_type[0]
-    
     debits = c.execute("SELECT COALESCE(SUM(amount), 0) FROM journal WHERE debit_account=?", (account,)).fetchone()[0]
     credits = c.execute("SELECT COALESCE(SUM(amount), 0) FROM journal WHERE credit_account=?", (account,)).fetchone()[0]
     c.close()
-    
-    # Assets & Expenses: debit - credit (debit-normal)
-    # Liabilities, Equity, Income: credit - debit (credit-normal)
     if acc_type in ("asset", "expense"):
         return debits - credits
     else:
@@ -126,46 +123,49 @@ def get_totals_by_type():
     return totals, by_account
 
 
-# ============== TELEGRAM HANDLERS ==============
+# ============== HANDLERS ==============
 async def start(u, c):
     await u.message.reply_text(
-        "🏦 محاسبك الشخصي - نظام محاسبة كامل\n"
+        "🏦 محاسبك الشخصي\n"
         "━━━━━━━━━━━━━━━\n\n"
         "📝 لاضافة معاملة، اكتبها طبيعي:\n"
         "  • قهوة 18\n"
         "  • راتب 8000\n"
-        "  • اشتريت اسهم بـ 5000\n"
-        "  • سددت قرض 2000\n\n"
+        "  • اشتريت ذهب 5000\n\n"
         "📊 التقارير:\n"
         "  /balance - الميزانية العمومية\n"
         "  /income - قائمة الدخل\n"
         "  /networth - صافي الثروة\n"
-        "  /accounts - كل الحسابات\n"
+        "  /accounts - شجرة الحسابات\n"
         "  /last10 - آخر المعاملات\n\n"
-        "🛠️ ادارة الحسابات:\n"
-        "  /addaccount - اضف حساب جديد\n"
-        "  /help - مساعدة"
+        "🛠️ الإدارة:\n"
+        "  /opening - رصيد افتتاحي\n"
+        "  /delete - حذف معاملة\n"
+        "  /reset - مسح الكل\n"
+        "  /addaccount - حساب جديد\n"
+        "  /help - المساعدة"
     )
 
 
 async def help_cmd(u, c):
     await u.message.reply_text(
-        "📖 الدليل السريع\n"
+        "📖 الدليل الكامل\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "💡 امثلة على المعاملات:\n\n"
-        "مصاريف:\n"
+        "💡 المعاملات:\n"
         "  قهوة 18\n"
-        "  بنزين 200\n\n"
-        "دخل:\n"
         "  راتب 8000\n"
-        "  بيع منتج 500\n\n"
-        "تحويلات (اصول):\n"
+        "  اشتريت اسهم 5000\n"
         "  حولت 1000 للبنك\n"
-        "  اشتريت ذهب 3000\n\n"
-        "قروض (خصوم):\n"
-        "  اخذت قرض 50000\n"
-        "  سددت قسط 2000\n\n"
-        "📊 كل التقارير تجي من البيانات المدخلة"
+        "  اخذت قرض 10000\n\n"
+        "🔧 إدارة الأرصدة:\n\n"
+        "/opening <الحساب> <المبلغ>\n"
+        "  مثال: /opening نقد 5000\n"
+        "  مثال: /opening بنك 50000\n\n"
+        "/delete <رقم_المعاملة>\n"
+        "  مثال: /delete 5\n"
+        "  (شوف الأرقام من /last10)\n\n"
+        "/reset\n"
+        "  يمسح كل المعاملات (احذر!)"
     )
 
 
@@ -174,7 +174,6 @@ async def cmd_accounts(u, c):
     by_type = {}
     for name, atype in accounts:
         by_type.setdefault(atype, []).append(name)
-    
     labels = {
         "asset": "💰 الأصول",
         "liability": "💳 الخصوم",
@@ -182,7 +181,6 @@ async def cmd_accounts(u, c):
         "income": "💵 الدخل",
         "expense": "💸 المصاريف"
     }
-    
     text = "🗂️ شجرة الحسابات\n━━━━━━━━━━━━━━━\n\n"
     for atype in ("asset", "liability", "equity", "income", "expense"):
         if atype in by_type:
@@ -195,13 +193,10 @@ async def cmd_accounts(u, c):
 
 
 async def cmd_balance(u, c):
-    """Balance Sheet"""
     totals, by_acc = get_totals_by_type()
-    
     text = "📋 الميزانية العمومية\n"
     text += f"   {datetime.now().strftime('%Y-%m-%d')}\n"
     text += "━━━━━━━━━━━━━━━\n\n"
-    
     text += "💰 الأصول:\n"
     assets_total = 0
     for name, (atype, bal) in by_acc.items():
@@ -209,8 +204,7 @@ async def cmd_balance(u, c):
             text += f"  {name}: {bal:,.0f}\n"
             assets_total += bal
     text += f"  ─────────\n"
-    text += f"  مجموع الأصول: {assets_total:,.0f}\n\n"
-    
+    text += f"  المجموع: {assets_total:,.0f}\n\n"
     text += "💳 الخصوم:\n"
     liab_total = 0
     for name, (atype, bal) in by_acc.items():
@@ -220,39 +214,30 @@ async def cmd_balance(u, c):
     if liab_total == 0:
         text += "  (لا يوجد)\n"
     text += f"  ─────────\n"
-    text += f"  مجموع الخصوم: {liab_total:,.0f}\n\n"
-    
-    # Net income (income - expense) goes to equity
+    text += f"  المجموع: {liab_total:,.0f}\n\n"
     net_income = totals["income"] - totals["expense"]
     equity_total = totals["equity"] + net_income
-    
     text += "📈 حقوق الملكية:\n"
     text += f"  رأس المال: {totals['equity']:,.0f}\n"
     text += f"  الأرباح المحتجزة: {net_income:,.0f}\n"
     text += f"  ─────────\n"
-    text += f"  مجموع حقوق الملكية: {equity_total:,.0f}\n\n"
-    
+    text += f"  المجموع: {equity_total:,.0f}\n\n"
     text += "━━━━━━━━━━━━━━━\n"
     text += f"إجمالي الأصول: {assets_total:,.0f}\n"
     text += f"إجمالي الخصوم + حقوق الملكية: {liab_total + equity_total:,.0f}\n"
-    
     diff = assets_total - (liab_total + equity_total)
     if abs(diff) > 0.01:
         text += f"⚠️ فرق: {diff:,.0f}"
     else:
-        text += "✅ الميزانية متوازنة"
-    
+        text += "✅ متوازنة"
     await u.message.reply_text(text)
 
 
 async def cmd_income(u, c):
-    """Income Statement"""
     totals, by_acc = get_totals_by_type()
-    
     text = "📊 قائمة الدخل\n"
     text += f"   {datetime.now().strftime('%Y-%m')}\n"
     text += "━━━━━━━━━━━━━━━\n\n"
-    
     text += "💵 الإيرادات:\n"
     income_total = 0
     for name, (atype, bal) in by_acc.items():
@@ -263,7 +248,6 @@ async def cmd_income(u, c):
         text += "  (لا يوجد)\n"
     text += f"  ─────────\n"
     text += f"  مجموع الدخل: {income_total:,.0f}\n\n"
-    
     text += "💸 المصاريف:\n"
     exp_total = 0
     for name, (atype, bal) in by_acc.items():
@@ -274,51 +258,163 @@ async def cmd_income(u, c):
         text += "  (لا يوجد)\n"
     text += f"  ─────────\n"
     text += f"  مجموع المصاريف: {exp_total:,.0f}\n\n"
-    
     text += "━━━━━━━━━━━━━━━\n"
     net = income_total - exp_total
     if net >= 0:
         text += f"✅ صافي الربح: {net:,.0f}"
     else:
         text += f"⚠️ صافي الخسارة: {abs(net):,.0f}"
-    
     await u.message.reply_text(text)
 
 
 async def cmd_networth(u, c):
-    """Quick Net Worth"""
     totals, _ = get_totals_by_type()
     net_worth = totals["asset"] - totals["liability"]
-    
     text = "💎 صافي الثروة\n"
     text += "━━━━━━━━━━━━━━━\n"
     text += f"الأصول:  {totals['asset']:>12,.0f}\n"
     text += f"الخصوم:  {totals['liability']:>12,.0f}\n"
     text += "━━━━━━━━━━━━━━━\n"
     text += f"الصافي:  {net_worth:>12,.0f} ريال"
-    
     await u.message.reply_text(text)
 
 
 async def cmd_last10(u, c):
     conn = sqlite3.connect(DB)
     rows = conn.execute(
-        "SELECT date, description, debit_account, credit_account, amount FROM journal ORDER BY id DESC LIMIT 10"
+        "SELECT id, date, description, debit_account, credit_account, amount FROM journal ORDER BY id DESC LIMIT 10"
     ).fetchall()
     conn.close()
-    
     if not rows:
         await u.message.reply_text("ما في معاملات بعد")
         return
-    
     text = "📜 آخر 10 معاملات\n━━━━━━━━━━━━━━━\n\n"
     for r in rows:
-        text += f"📅 {r[0]}\n"
-        text += f"   {r[1]}\n"
-        text += f"   من: {r[3]} → الى: {r[2]}\n"
-        text += f"   💰 {r[4]:,.0f}\n\n"
-    
+        text += f"🔢 #{r[0]} | 📅 {r[1]}\n"
+        text += f"   {r[2]}\n"
+        text += f"   من: {r[4]} → الى: {r[3]}\n"
+        text += f"   💰 {r[5]:,.0f}\n\n"
+    text += "💡 لحذف معاملة: /delete <الرقم>"
     await u.message.reply_text(text)
+
+
+async def cmd_opening(u, c):
+    args = u.message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await u.message.reply_text(
+            "📌 رصيد افتتاحي\n\n"
+            "الاستخدام:\n"
+            "/opening <اسم الحساب> <المبلغ>\n\n"
+            "أمثلة:\n"
+            "/opening نقد 5000\n"
+            "/opening بنك 50000\n"
+            "/opening قرض 30000\n\n"
+            "🔍 شوف الحسابات: /accounts"
+        )
+        return
+    
+    account = args[1]
+    try:
+        amount = float(args[2])
+    except ValueError:
+        await u.message.reply_text("⚠️ المبلغ يجب أن يكون رقماً")
+        return
+    
+    atype = account_exists(account)
+    if not atype:
+        await u.message.reply_text(f"⚠️ حساب '{account}' غير موجود\n\nشوف الحسابات: /accounts")
+        return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    desc = f"رصيد افتتاحي - {account}"
+    
+    # Logic: for assets, debit account / credit equity
+    # For liabilities, debit equity / credit account
+    if atype == "asset":
+        post_entry(today, desc, account, "رأس المال", amount)
+    elif atype == "liability":
+        post_entry(today, desc, "رأس المال", account, amount)
+    else:
+        await u.message.reply_text("⚠️ الرصيد الافتتاحي للأصول والخصوم فقط")
+        return
+    
+    new_bal = get_balance(account)
+    await u.message.reply_text(
+        f"✅ تم تسجيل الرصيد الافتتاحي\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"الحساب: {account}\n"
+        f"المبلغ: {amount:,.0f}\n"
+        f"الرصيد الجديد: {new_bal:,.0f}"
+    )
+
+
+async def cmd_delete(u, c):
+    args = u.message.text.split()
+    if len(args) < 2:
+        await u.message.reply_text(
+            "📌 حذف معاملة\n\n"
+            "الاستخدام:\n"
+            "/delete <رقم المعاملة>\n\n"
+            "مثال: /delete 5\n\n"
+            "🔍 شوف الأرقام: /last10"
+        )
+        return
+    
+    try:
+        entry_id = int(args[1])
+    except ValueError:
+        await u.message.reply_text("⚠️ الرقم غير صحيح")
+        return
+    
+    conn = sqlite3.connect(DB)
+    row = conn.execute(
+        "SELECT date, description, debit_account, credit_account, amount FROM journal WHERE id=?",
+        (entry_id,)
+    ).fetchone()
+    
+    if not row:
+        conn.close()
+        await u.message.reply_text(f"⚠️ لا توجد معاملة برقم {entry_id}")
+        return
+    
+    conn.execute("DELETE FROM journal WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
+    
+    await u.message.reply_text(
+        f"🗑️ تم حذف المعاملة\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔢 #{entry_id}\n"
+        f"📅 {row[0]}\n"
+        f"📝 {row[1]}\n"
+        f"💰 {row[4]:,.0f}"
+    )
+
+
+async def cmd_reset(u, c):
+    args = u.message.text.split()
+    if len(args) < 2 or args[1] != "confirm":
+        await u.message.reply_text(
+            "⚠️ تحذير: سيتم مسح كل المعاملات!\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "هل أنت متأكد؟\n\n"
+            "للتأكيد اكتب:\n"
+            "/reset confirm"
+        )
+        return
+    
+    conn = sqlite3.connect(DB)
+    count = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+    conn.execute("DELETE FROM journal")
+    conn.commit()
+    conn.close()
+    
+    await u.message.reply_text(
+        f"🧹 تم مسح {count} معاملة\n\n"
+        f"💡 ابدأ بتسجيل أرصدتك الافتتاحية:\n"
+        f"/opening نقد <المبلغ>\n"
+        f"/opening بنك <المبلغ>"
+    )
 
 
 async def cmd_addaccount(u, c):
@@ -329,26 +425,22 @@ async def cmd_addaccount(u, c):
             "/addaccount <النوع> <الاسم>\n\n"
             "الأنواع: asset, liability, equity, income, expense\n\n"
             "مثال:\n"
-            "/addaccount asset محفظة الجيب\n"
-            "/addaccount liability قرض السيارة"
+            "/addaccount asset محفظة الجيب"
         )
         return
-    
     atype = args[1].lower()
     name = args[2]
-    
     if atype not in ("asset", "liability", "equity", "income", "expense"):
-        await u.message.reply_text("النوع غير صحيح. استخدم: asset, liability, equity, income, expense")
+        await u.message.reply_text("النوع غير صحيح")
         return
-    
     try:
         conn = sqlite3.connect(DB)
         conn.execute("INSERT INTO accounts (name, type) VALUES (?, ?)", (name, atype))
         conn.commit()
         conn.close()
-        await u.message.reply_text(f"✅ تم اضافة الحساب: {name} ({atype})")
+        await u.message.reply_text(f"✅ تم اضافة: {name} ({atype})")
     except sqlite3.IntegrityError:
-        await u.message.reply_text("⚠️ الحساب موجود مسبقاً")
+        await u.message.reply_text("⚠️ الحساب موجود")
 
 
 # ============== AI PROCESSING ==============
@@ -362,15 +454,13 @@ async def process(u, c):
     
     if not re.search(r'\d+', msg):
         await u.message.reply_text(
-            "❌ الرسالة بدون مبلغ\n\n"
-            "اكتب: الوصف + المبلغ\n"
+            "❌ بدون مبلغ\n\n"
             "مثال: قهوة 18"
         )
         return
     
-    await u.message.reply_text("🔄 جاري تسجيل القيد المحاسبي...")
+    await u.message.reply_text("🔄 جاري التسجيل...")
     
-    # Get available accounts for context
     accounts = get_accounts()
     accounts_text = "\n".join([f"- {name} ({atype})" for name, atype in accounts])
     
@@ -378,49 +468,34 @@ async def process(u, c):
         r = ai.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
-            system=f'''You are a Saudi personal accounting assistant using DOUBLE-ENTRY bookkeeping.
-
+            system=f'''Saudi personal accounting with DOUBLE-ENTRY bookkeeping.
 TODAY: {today}
 
-AVAILABLE ACCOUNTS:
+ACCOUNTS:
 {accounts_text}
 
-RULES FOR DOUBLE ENTRY:
-- Every transaction has DEBIT (مدين) and CREDIT (دائن) of EQUAL amount
-- Assets ↑ = DEBIT | Assets ↓ = CREDIT
-- Liabilities ↑ = CREDIT | Liabilities ↓ = DEBIT  
-- Income = CREDIT
-- Expenses = DEBIT
-- Equity = CREDIT
+DOUBLE ENTRY RULES:
+- Assets ↑ DEBIT, Assets ↓ CREDIT
+- Liabilities ↑ CREDIT, Liabilities ↓ DEBIT
+- Income = CREDIT, Expenses = DEBIT, Equity = CREDIT
 
-COMMON PATTERNS:
-1. Expense paid in cash: DEBIT expense_account, CREDIT نقد
-   Example "قهوة 18": debit="طعام وشراب", credit="نقد", amount=18
+PATTERNS:
+1. Expense in cash: debit=expense_account, credit=نقد
+2. Expense from bank: debit=expense_account, credit=بنك
+3. Salary: debit=بنك, credit=راتب
+4. Buy investment: debit=استثمارات, credit=نقد or بنك
+5. Transfer: debit=destination, credit=source
+6. Take loan: debit=نقد, credit=قرض
+7. Pay loan: debit=قرض, credit=نقد
 
-2. Salary received: DEBIT نقد (or بنك), CREDIT راتب
-   Example "راتب 8000": debit="بنك", credit="راتب", amount=8000
+DEFAULT: If user doesn't specify source, assume بنك for amounts > 500, نقد for smaller.
 
-3. Buy investment: DEBIT استثمارات, CREDIT نقد
-   Example "اشتريت اسهم بـ 5000": debit="استثمارات", credit="نقد", amount=5000
+Reply ONLY with JSON:
+For transaction: {{"description":"وصف","debit_account":"exact name","credit_account":"exact name","amount":number}}
+For unclear: {{"needs_clarification":true,"reason":"السبب"}}
+For non-transaction: {{"not_transaction":true,"reply":"رد"}}
 
-4. Transfer between assets: DEBIT new_asset, CREDIT old_asset
-   Example "حولت 1000 للبنك": debit="بنك", credit="نقد", amount=1000
-
-5. Take loan: DEBIT نقد, CREDIT قرض
-6. Pay loan: DEBIT قرض, CREDIT نقد
-
-REPLY ONLY with valid JSON:
-
-For transaction:
-{{"description":"وصف بالعربي","debit_account":"اسم الحساب","credit_account":"اسم الحساب","amount":number}}
-
-For unclear:
-{{"needs_clarification":true,"reason":"السبب بالعربي"}}
-
-For non-transaction:
-{{"not_transaction":true,"reply":"رد مهذب"}}
-
-Use EXACT account names from the list above. If none fits, use closest match.''',
+Use EXACT account names from list.''',
             messages=[{"role": "user", "content": msg}]
         )
         
@@ -428,51 +503,44 @@ Use EXACT account names from the list above. If none fits, use closest match.'''
         d = json.loads(raw)
         
         if d.get("not_transaction"):
-            await u.message.reply_text(d.get("reply", "هذي مو معاملة مالية"))
+            await u.message.reply_text(d.get("reply", "مو معاملة"))
             return
         
         if d.get("needs_clarification"):
-            await u.message.reply_text(f"❓ {d.get('reason', 'محتاج توضيح')}")
+            await u.message.reply_text(f"❓ {d.get('reason')}")
             return
         
-        # Validate accounts exist
-        conn = sqlite3.connect(DB)
-        valid = lambda name: conn.execute("SELECT 1 FROM accounts WHERE name=?", (name,)).fetchone()
-        
-        if not valid(d["debit_account"]) or not valid(d["credit_account"]):
-            conn.close()
+        if not account_exists(d["debit_account"]) or not account_exists(d["credit_account"]):
             await u.message.reply_text(
                 f"⚠️ حساب غير موجود\n"
-                f"المدين: {d['debit_account']}\n"
-                f"الدائن: {d['credit_account']}\n\n"
-                f"شوف الحسابات: /accounts"
+                f"مدين: {d['debit_account']}\n"
+                f"دائن: {d['credit_account']}\n\n"
+                f"/accounts"
             )
             return
-        conn.close()
         
-        # Post the journal entry
-        post_entry(today, d["description"], d["debit_account"], d["credit_account"], d["amount"])
+        entry_id = post_entry(today, d["description"], d["debit_account"], d["credit_account"], d["amount"])
         
         await u.message.reply_text(
-            f"✅ تم تسجيل القيد\n"
+            f"✅ تم التسجيل #{entry_id}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📅 التاريخ: {today}\n"
-            f"📝 الوصف: {d['description']}\n"
-            f"💰 المبلغ: {d['amount']:,.0f} ريال\n\n"
+            f"📅 {today}\n"
+            f"📝 {d['description']}\n"
+            f"💰 {d['amount']:,.0f} ريال\n\n"
             f"⬆️ مدين: {d['debit_account']}\n"
             f"⬇️ دائن: {d['credit_account']}"
         )
     
     except json.JSONDecodeError:
-        await u.message.reply_text("⚠️ ما قدرت اقرا الرد، حاول بصيغة اوضح")
+        await u.message.reply_text("⚠️ ما قدرت أفهم، حاول بصيغة أوضح")
     except Exception as e:
-        await u.message.reply_text(f"⚠️ خطا تقني")
+        await u.message.reply_text("⚠️ خطأ تقني")
         print(f"Error: {e}")
 
 
 def main():
     init()
-    print("Bot running on Railway!")
+    print("Bot running!")
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -481,6 +549,9 @@ def main():
     app.add_handler(CommandHandler("income", cmd_income))
     app.add_handler(CommandHandler("networth", cmd_networth))
     app.add_handler(CommandHandler("last10", cmd_last10))
+    app.add_handler(CommandHandler("opening", cmd_opening))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("addaccount", cmd_addaccount))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process))
     app.run_polling()

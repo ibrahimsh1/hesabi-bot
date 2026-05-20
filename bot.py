@@ -8,7 +8,7 @@ import sqlite3
 import os
 import re
 import csv
-from datetime import datetime, time
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -136,40 +136,6 @@ def create_backup_file():
         for r in rows:
             writer.writerow(r)
     return path, len(rows)
-
-
-# ============== BACKUP JOB ==============
-async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs daily and sends backup to user"""
-    chat_id = get_setting("backup_chat_id")
-    if not chat_id:
-        return
-
-    path, count = create_backup_file()
-    today = datetime.now().strftime("%Y-%m-%d")
-    totals, _ = get_totals_by_type()
-    net_worth = totals["asset"] - totals["liability"]
-
-    caption = (
-        f"🔄 نسخة احتياطية تلقائية\n"
-        f"📅 {today}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"💰 الأصول:  {totals['asset']:,.0f}\n"
-        f"💳 الخصوم:  {totals['liability']:,.0f}\n"
-        f"💎 الصافي:  {net_worth:,.0f}\n"
-        f"📝 {count} معاملة محفوظة\n\n"
-        f"لو ضاعت البيانات: /import"
-    )
-
-    try:
-        await context.bot.send_document(
-            chat_id=int(chat_id),
-            document=open(path, "rb"),
-            filename=f"hesabi_{today}.csv",
-            caption=caption
-        )
-    except Exception as e:
-        print(f"Backup error: {e}")
 
 
 # ============== COMMANDS ==============
@@ -579,9 +545,6 @@ def main():
     init()
     print("Bot running with daily backup!")
     app = Application.builder().token(TOKEN).build()
-
-    # Daily backup at 9 PM Riyadh time (UTC+3 = 18:00 UTC)
-    app.job_queue.run_daily(daily_backup_job, time=time(hour=18, minute=0))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))

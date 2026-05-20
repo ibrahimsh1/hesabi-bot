@@ -1,6 +1,6 @@
 """
 Hesabi Bot - Full Personal Accounting System
-With persistent storage, CSV import/export
+With daily automatic backup to Telegram
 """
 import anthropic
 import json
@@ -8,15 +8,13 @@ import sqlite3
 import os
 import re
 import csv
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from datetime import datetime
+from datetime import datetime, time
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.environ.get("TOKEN", "")
 KEY = os.environ.get("KEY", "")
-# Use Railway volume mount path, fallback to local
-DB = os.environ.get("DB_PATH", "/data/hesabi.db")
-# Ensure directory exists
-os.makedirs(os.path.dirname(DB), exist_ok=True)
+DB = os.environ.get("DB_PATH", "hesabi.db")
 
 ai = anthropic.Anthropic(api_key=KEY)
 
@@ -38,6 +36,10 @@ def init():
         credit_account TEXT,
         amount REAL
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
     count = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
     if count == 0:
         defaults = [
@@ -54,6 +56,20 @@ def init():
         c.executemany("INSERT INTO accounts (name, type) VALUES (?, ?)", defaults)
     c.commit()
     c.close()
+
+
+def save_setting(key, value):
+    c = sqlite3.connect(DB)
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    c.commit()
+    c.close()
+
+
+def get_setting(key):
+    c = sqlite3.connect(DB)
+    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    c.close()
+    return r[0] if r else None
 
 
 def post_entry(date, desc, debit_acc, credit_acc, amount):
@@ -90,9 +106,7 @@ def get_balance(account):
     debits = c.execute("SELECT COALESCE(SUM(amount), 0) FROM journal WHERE debit_account=?", (account,)).fetchone()[0]
     credits = c.execute("SELECT COALESCE(SUM(amount), 0) FROM journal WHERE credit_account=?", (account,)).fetchone()[0]
     c.close()
-    if acc_type in ("asset", "expense"):
-        return debits - credits
-    return credits - debits
+    return (debits - credits) if acc_type in ("asset", "expense") else (credits - debits)
 
 
 def get_totals_by_type():
@@ -109,12 +123,65 @@ def get_totals_by_type():
     return totals, by_account
 
 
+def create_backup_file():
+    """Create CSV backup and return path"""
+    conn = sqlite3.connect(DB)
+    rows = conn.execute("SELECT id, date, description, debit_account, credit_account, amount FROM journal ORDER BY date, id").fetchall()
+    conn.close()
+
+    path = "/tmp/hesabi_backup.csv"
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "date", "description", "debit_account", "credit_account", "amount"])
+        for r in rows:
+            writer.writerow(r)
+    return path, len(rows)
+
+
+# ============== BACKUP JOB ==============
+async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs daily and sends backup to user"""
+    chat_id = get_setting("backup_chat_id")
+    if not chat_id:
+        return
+
+    path, count = create_backup_file()
+    today = datetime.now().strftime("%Y-%m-%d")
+    totals, _ = get_totals_by_type()
+    net_worth = totals["asset"] - totals["liability"]
+
+    caption = (
+        f"🔄 نسخة احتياطية تلقائية\n"
+        f"📅 {today}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💰 الأصول:  {totals['asset']:,.0f}\n"
+        f"💳 الخصوم:  {totals['liability']:,.0f}\n"
+        f"💎 الصافي:  {net_worth:,.0f}\n"
+        f"📝 {count} معاملة محفوظة\n\n"
+        f"لو ضاعت البيانات: /import"
+    )
+
+    try:
+        await context.bot.send_document(
+            chat_id=int(chat_id),
+            document=open(path, "rb"),
+            filename=f"hesabi_{today}.csv",
+            caption=caption
+        )
+    except Exception as e:
+        print(f"Backup error: {e}")
+
+
 # ============== COMMANDS ==============
-async def start(u, c):
+async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    # Save chat_id for backup
+    chat_id = str(u.message.chat_id)
+    save_setting("backup_chat_id", chat_id)
+
     await u.message.reply_text(
         "🏦 محاسبك الشخصي\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "📝 معاملة طبيعية:\n"
+        "📝 معاملة:\n"
         "  قهوة 18 | راتب 8000\n\n"
         "📊 التقارير:\n"
         "  /balance - الميزانية\n"
@@ -123,6 +190,7 @@ async def start(u, c):
         "  /accounts - الحسابات\n"
         "  /last10 - آخر المعاملات\n\n"
         "💾 البيانات:\n"
+        "  /backup - نسخة احتياطية\n"
         "  /export - تصدير CSV\n"
         "  /import - استيراد CSV\n\n"
         "🛠️ الإدارة:\n"
@@ -133,28 +201,27 @@ async def start(u, c):
     )
 
 
-async def help_cmd(u, c):
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "📖 الدليل\n━━━━━━━━━━━━━━━\n\n"
         "💡 معاملات:\n"
         "  قهوة 18\n"
         "  راتب 8000\n"
-        "  اشتريت ذهب 5000\n\n"
+        "  اشتريت ذهب 5000\n"
+        "  اخذت قرض 10000\n\n"
         "🔧 ادارة:\n"
         "  /opening نقد 5000\n"
         "  /delete 5\n"
         "  /reset confirm\n\n"
         "💾 ملفات:\n"
-        "  /export ← يرسل CSV\n"
-        "  /import ← ارفع CSV بعدها\n\n"
-        "📋 صيغة الاستيراد:\n"
-        "  date,description,debit,credit,amount\n"
-        "  أو رصيد افتتاحي:\n"
-        "  account,amount"
+        "  /backup ← فوري\n"
+        "  البوت يرسل backup يومياً تلقائياً\n\n"
+        "📋 استيراد:\n"
+        "  ارفع CSV بعد /import"
     )
 
 
-async def cmd_accounts(u, c):
+async def cmd_accounts(u: Update, c: ContextTypes.DEFAULT_TYPE):
     accounts = get_accounts()
     by_type = {}
     for name, atype in accounts:
@@ -172,7 +239,7 @@ async def cmd_accounts(u, c):
     await u.message.reply_text(text)
 
 
-async def cmd_balance(u, c):
+async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
     totals, by_acc = get_totals_by_type()
     text = f"📋 الميزانية العمومية\n   {datetime.now().strftime('%Y-%m-%d')}\n━━━━━━━━━━━━━━━\n\n"
     text += "💰 الأصول:\n"
@@ -196,14 +263,12 @@ async def cmd_balance(u, c):
     text += f"📈 حقوق الملكية:\n  رأس المال: {totals['equity']:,.0f}\n  الأرباح: {net_income:,.0f}\n"
     text += f"  ─────────\n  المجموع: {equity_total:,.0f}\n\n"
     text += f"━━━━━━━━━━━━━━━\n"
-    text += f"الأصول: {assets_total:,.0f}\n"
-    text += f"الخصوم + الملكية: {liab_total + equity_total:,.0f}\n"
     diff = assets_total - (liab_total + equity_total)
     text += f"✅ متوازنة" if abs(diff) < 0.01 else f"⚠️ فرق: {diff:,.0f}"
     await u.message.reply_text(text)
 
 
-async def cmd_income(u, c):
+async def cmd_income(u: Update, c: ContextTypes.DEFAULT_TYPE):
     totals, by_acc = get_totals_by_type()
     text = f"📊 قائمة الدخل\n   {datetime.now().strftime('%Y-%m')}\n━━━━━━━━━━━━━━━\n\n"
     text += "💵 الإيرادات:\n"
@@ -214,7 +279,7 @@ async def cmd_income(u, c):
             income_total += bal
     if income_total == 0:
         text += "  (لا يوجد)\n"
-    text += f"  ─────────\n  مجموع الدخل: {income_total:,.0f}\n\n"
+    text += f"  ─────────\n  المجموع: {income_total:,.0f}\n\n"
     text += "💸 المصاريف:\n"
     exp_total = 0
     for name, (atype, bal) in by_acc.items():
@@ -223,25 +288,25 @@ async def cmd_income(u, c):
             exp_total += bal
     if exp_total == 0:
         text += "  (لا يوجد)\n"
-    text += f"  ─────────\n  مجموع المصاريف: {exp_total:,.0f}\n\n"
-    text += "━━━━━━━━━━━━━━━\n"
+    text += f"  ─────────\n  المجموع: {exp_total:,.0f}\n\n"
     net = income_total - exp_total
     text += f"✅ صافي الربح: {net:,.0f}" if net >= 0 else f"⚠️ صافي الخسارة: {abs(net):,.0f}"
     await u.message.reply_text(text)
 
 
-async def cmd_networth(u, c):
+async def cmd_networth(u: Update, c: ContextTypes.DEFAULT_TYPE):
     totals, _ = get_totals_by_type()
     net_worth = totals["asset"] - totals["liability"]
-    text = f"💎 صافي الثروة\n━━━━━━━━━━━━━━━\n"
-    text += f"الأصول:  {totals['asset']:>12,.0f}\n"
-    text += f"الخصوم:  {totals['liability']:>12,.0f}\n"
-    text += f"━━━━━━━━━━━━━━━\n"
-    text += f"الصافي:  {net_worth:>12,.0f} ريال"
-    await u.message.reply_text(text)
+    await u.message.reply_text(
+        f"💎 صافي الثروة\n━━━━━━━━━━━━━━━\n"
+        f"الأصول:  {totals['asset']:>12,.0f}\n"
+        f"الخصوم:  {totals['liability']:>12,.0f}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"الصافي:  {net_worth:>12,.0f} ريال"
+    )
 
 
-async def cmd_last10(u, c):
+async def cmd_last10(u: Update, c: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
     rows = conn.execute("SELECT id, date, description, debit_account, credit_account, amount FROM journal ORDER BY id DESC LIMIT 10").fetchall()
     conn.close()
@@ -255,17 +320,126 @@ async def cmd_last10(u, c):
     await u.message.reply_text(text)
 
 
-async def cmd_opening(u, c):
+async def cmd_backup(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Manual backup"""
+    save_setting("backup_chat_id", str(u.message.chat_id))
+    path, count = create_backup_file()
+    today = datetime.now().strftime("%Y-%m-%d")
+    totals, _ = get_totals_by_type()
+    net_worth = totals["asset"] - totals["liability"]
+    await u.message.reply_document(
+        document=open(path, "rb"),
+        filename=f"hesabi_{today}.csv",
+        caption=(
+            f"💾 نسخة احتياطية\n"
+            f"📅 {today}\n"
+            f"💎 صافي الثروة: {net_worth:,.0f}\n"
+            f"📝 {count} معاملة\n\n"
+            f"احتفظ بهذا الملف\n"
+            f"لاستعادته: /import"
+        )
+    )
+
+
+async def cmd_export(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Export with accounts summary"""
+    conn = sqlite3.connect(DB)
+    rows = conn.execute("SELECT id, date, description, debit_account, credit_account, amount FROM journal ORDER BY date, id").fetchall()
+    accounts = conn.execute("SELECT name, type FROM accounts").fetchall()
+    conn.close()
+    if not rows:
+        await u.message.reply_text("ما في بيانات")
+        return
+    path = "/tmp/hesabi_export.csv"
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "date", "description", "debit_account", "credit_account", "amount"])
+        for r in rows:
+            writer.writerow(r)
+    path2 = "/tmp/hesabi_accounts.csv"
+    with open(path2, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["account", "type", "balance"])
+        for name, atype in accounts:
+            bal = get_balance(name)
+            if abs(bal) > 0.01:
+                writer.writerow([name, atype, f"{bal:.2f}"])
+    await u.message.reply_document(document=open(path, "rb"), filename="hesabi_journal.csv", caption="📒 دفتر اليومية")
+    await u.message.reply_document(document=open(path2, "rb"), filename="hesabi_accounts.csv", caption="📊 الحسابات والأرصدة")
+
+
+async def cmd_import(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "📥 الاستيراد\n━━━━━━━━━━━━━━━\n\n"
+        "ارفع ملف CSV بإحدى الصيغتين:\n\n"
+        "1️⃣ أرصدة افتتاحية:\n"
+        "account,amount\n"
+        "نقد,5000\n"
+        "بنك,50000\n\n"
+        "2️⃣ معاملات كاملة:\n"
+        "date,description,debit,credit,amount\n\n"
+        "💡 ارفع الملف وبيشتغل تلقائياً"
+    )
+
+
+async def handle_document(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    doc = u.message.document
+    if not doc.file_name.lower().endswith('.csv'):
+        return
+    file = await doc.get_file()
+    path = "/tmp/import.csv"
+    await file.download_to_drive(path)
+    await u.message.reply_text("📥 جاري الاستيراد...")
+    today = datetime.now().strftime("%Y-%m-%d")
+    success = 0
+    errors = []
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        header = rows[0] if rows else []
+        data = rows[1:] if any(col.lower() in ('id', 'date', 'account', 'description') for col in header) else rows
+        for i, row in enumerate(data, start=2):
+            row = [x.strip() for x in row]
+            try:
+                if len(row) == 2:
+                    account, amount = row[0], float(row[1])
+                    atype = account_exists(account)
+                    if not atype:
+                        errors.append(f"سطر {i}: '{account}' غير موجود")
+                        continue
+                    if atype == "asset":
+                        post_entry(today, f"رصيد افتتاحي - {account}", account, "رأس المال", amount)
+                    elif atype == "liability":
+                        post_entry(today, f"رصيد افتتاحي - {account}", "رأس المال", account, amount)
+                    success += 1
+                elif len(row) >= 5:
+                    if len(row) == 6:
+                        date, desc, debit, credit, amount = row[1], row[2], row[3], row[4], float(row[5])
+                    else:
+                        date, desc, debit, credit, amount = row[0], row[1], row[2], row[3], float(row[4])
+                    if not account_exists(debit):
+                        errors.append(f"سطر {i}: '{debit}' غير موجود")
+                        continue
+                    if not account_exists(credit):
+                        errors.append(f"سطر {i}: '{credit}' غير موجود")
+                        continue
+                    post_entry(date, desc, debit, credit, amount)
+                    success += 1
+            except Exception as e:
+                errors.append(f"سطر {i}: {str(e)[:30]}")
+        msg = f"✅ تم استيراد {success} سجل"
+        if errors:
+            msg += f"\n⚠️ {len(errors)} خطأ:\n" + "\n".join(errors[:5])
+        await u.message.reply_text(msg)
+    except Exception as e:
+        await u.message.reply_text(f"⚠️ خطأ: {str(e)[:100]}")
+
+
+async def cmd_opening(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = u.message.text.split(maxsplit=2)
     if len(args) < 3:
-        await u.message.reply_text(
-            "📌 رصيد افتتاحي\n\n"
-            "/opening <الحساب> <المبلغ>\n\n"
-            "أمثلة:\n"
-            "/opening نقد 5000\n"
-            "/opening بنك 50000\n"
-            "/opening قرض 30000"
-        )
+        await u.message.reply_text("/opening <الحساب> <المبلغ>\n\nمثال:\n/opening نقد 5000\n/opening بنك 50000")
         return
     account = args[1]
     try:
@@ -275,25 +449,23 @@ async def cmd_opening(u, c):
         return
     atype = account_exists(account)
     if not atype:
-        await u.message.reply_text(f"⚠️ حساب '{account}' غير موجود")
+        await u.message.reply_text(f"⚠️ '{account}' غير موجود\n\n/accounts")
         return
     today = datetime.now().strftime("%Y-%m-%d")
-    desc = f"رصيد افتتاحي - {account}"
     if atype == "asset":
-        post_entry(today, desc, account, "رأس المال", amount)
+        post_entry(today, f"رصيد افتتاحي - {account}", account, "رأس المال", amount)
     elif atype == "liability":
-        post_entry(today, desc, "رأس المال", account, amount)
+        post_entry(today, f"رصيد افتتاحي - {account}", "رأس المال", account, amount)
     else:
         await u.message.reply_text("⚠️ للأصول والخصوم فقط")
         return
-    new_bal = get_balance(account)
-    await u.message.reply_text(f"✅ تم\n{account}: {new_bal:,.0f}")
+    await u.message.reply_text(f"✅ {account}: {get_balance(account):,.0f}")
 
 
-async def cmd_delete(u, c):
+async def cmd_delete(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = u.message.text.split()
     if len(args) < 2:
-        await u.message.reply_text("/delete <رقم>\nشوف الأرقام: /last10")
+        await u.message.reply_text("/delete <رقم>\n/last10")
         return
     try:
         entry_id = int(args[1])
@@ -304,15 +476,15 @@ async def cmd_delete(u, c):
     row = conn.execute("SELECT date, description, amount FROM journal WHERE id=?", (entry_id,)).fetchone()
     if not row:
         conn.close()
-        await u.message.reply_text(f"⚠️ المعاملة {entry_id} غير موجودة")
+        await u.message.reply_text(f"⚠️ #{entry_id} غير موجود")
         return
     conn.execute("DELETE FROM journal WHERE id=?", (entry_id,))
     conn.commit()
     conn.close()
-    await u.message.reply_text(f"🗑️ تم حذف #{entry_id}\n{row[1]} - {row[2]:,.0f}")
+    await u.message.reply_text(f"🗑️ تم حذف #{entry_id}: {row[1]} - {row[2]:,.0f}")
 
 
-async def cmd_reset(u, c):
+async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = u.message.text.split()
     if len(args) < 2 or args[1] != "confirm":
         await u.message.reply_text("⚠️ سيُمسح كل شيء!\nللتأكيد: /reset confirm")
@@ -322,19 +494,15 @@ async def cmd_reset(u, c):
     conn.execute("DELETE FROM journal")
     conn.commit()
     conn.close()
-    await u.message.reply_text(f"🧹 تم مسح {count} معاملة")
+    await u.message.reply_text(f"🧹 تم مسح {count} معاملة\n\nابدأ بـ /opening")
 
 
-async def cmd_addaccount(u, c):
+async def cmd_addaccount(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = u.message.text.split(maxsplit=2)
     if len(args) < 3:
-        await u.message.reply_text(
-            "/addaccount <النوع> <الاسم>\n"
-            "الأنواع: asset, liability, equity, income, expense"
-        )
+        await u.message.reply_text("/addaccount <النوع> <الاسم>\nالأنواع: asset, liability, equity, income, expense")
         return
-    atype = args[1].lower()
-    name = args[2]
+    atype, name = args[1].lower(), args[2]
     if atype not in ("asset", "liability", "equity", "income", "expense"):
         await u.message.reply_text("نوع غير صحيح")
         return
@@ -343,190 +511,48 @@ async def cmd_addaccount(u, c):
         conn.execute("INSERT INTO accounts (name, type) VALUES (?, ?)", (name, atype))
         conn.commit()
         conn.close()
-        await u.message.reply_text(f"✅ تم اضافة: {name}")
+        await u.message.reply_text(f"✅ تم: {name}")
     except sqlite3.IntegrityError:
         await u.message.reply_text("⚠️ موجود")
 
 
-async def cmd_export(u, c):
-    """Export all journal entries as CSV"""
-    conn = sqlite3.connect(DB)
-    rows = conn.execute("SELECT id, date, description, debit_account, credit_account, amount FROM journal ORDER BY date, id").fetchall()
-    accounts = conn.execute("SELECT name, type FROM accounts").fetchall()
-    conn.close()
-    
-    if not rows:
-        await u.message.reply_text("ما في بيانات للتصدير")
-        return
-    
-    # Journal CSV
-    path = "/tmp/hesabi_export.csv"
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "date", "description", "debit_account", "credit_account", "amount"])
-        for r in rows:
-            writer.writerow(r)
-    
-    # Accounts summary
-    path2 = "/tmp/hesabi_accounts.csv"
-    with open(path2, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["account", "type", "balance"])
-        for name, atype in accounts:
-            bal = get_balance(name)
-            if abs(bal) > 0.01:
-                writer.writerow([name, atype, f"{bal:.2f}"])
-    
-    await u.message.reply_text(f"📤 جاري تصدير {len(rows)} معاملة...")
-    await u.message.reply_document(document=open(path, "rb"), filename="hesabi_journal.csv", caption="📒 دفتر اليومية")
-    await u.message.reply_document(document=open(path2, "rb"), filename="hesabi_accounts.csv", caption="📊 الحسابات والأرصدة")
-
-
-async def cmd_import(u, c):
-    """Instructions for import"""
-    await u.message.reply_text(
-        "📥 الاستيراد\n━━━━━━━━━━━━━━━\n\n"
-        "ارفع ملف CSV بإحدى الصيغتين:\n\n"
-        "1️⃣ أرصدة افتتاحية (عمودين):\n"
-        "account,amount\n"
-        "نقد,5000\n"
-        "بنك,50000\n\n"
-        "2️⃣ معاملات كاملة (5 أعمدة):\n"
-        "date,description,debit,credit,amount\n"
-        "2026-05-18,قهوة,طعام وشراب,نقد,18\n\n"
-        "💡 فقط ارفع الملف وبيشتغل تلقائياً"
-    )
-
-
-async def handle_document(u, c):
-    """Handle uploaded CSV files for import"""
-    doc = u.message.document
-    if not doc.file_name.lower().endswith('.csv'):
-        await u.message.reply_text("⚠️ ارفع ملف CSV فقط")
-        return
-    
-    file = await doc.get_file()
-    path = "/tmp/import.csv"
-    await file.download_to_drive(path)
-    
-    await u.message.reply_text("📥 جاري الاستيراد...")
-    
-    today = datetime.now().strftime("%Y-%m-%d")
-    success = 0
-    errors = []
-    
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-        
-        if not rows:
-            await u.message.reply_text("⚠️ الملف فاضي")
-            return
-        
-        # Detect format by header or column count
-        header = rows[0]
-        data = rows[1:] if any(c.lower() in ('id', 'date', 'account', 'description') for c in header) else rows
-        
-        for i, row in enumerate(data, start=2):
-            try:
-                if len(row) == 2:
-                    # Opening balance format: account, amount
-                    account = row[0].strip()
-                    amount = float(row[1].strip())
-                    atype = account_exists(account)
-                    if not atype:
-                        errors.append(f"سطر {i}: حساب '{account}' غير موجود")
-                        continue
-                    desc = f"رصيد افتتاحي - {account}"
-                    if atype == "asset":
-                        post_entry(today, desc, account, "رأس المال", amount)
-                    elif atype == "liability":
-                        post_entry(today, desc, "رأس المال", account, amount)
-                    else:
-                        errors.append(f"سطر {i}: '{account}' ليس أصل/خصم")
-                        continue
-                    success += 1
-                
-                elif len(row) >= 5:
-                    # Full format: [id?], date, description, debit, credit, amount
-                    if len(row) == 6:  # has id column
-                        date, desc, debit, credit, amount = row[1], row[2], row[3], row[4], row[5]
-                    else:  # no id
-                        date, desc, debit, credit, amount = row[0], row[1], row[2], row[3], row[4]
-                    
-                    if not account_exists(debit.strip()):
-                        errors.append(f"سطر {i}: حساب مدين '{debit}' غير موجود")
-                        continue
-                    if not account_exists(credit.strip()):
-                        errors.append(f"سطر {i}: حساب دائن '{credit}' غير موجود")
-                        continue
-                    
-                    post_entry(date.strip(), desc.strip(), debit.strip(), credit.strip(), float(amount))
-                    success += 1
-                else:
-                    errors.append(f"سطر {i}: صيغة غير صحيحة")
-            except Exception as e:
-                errors.append(f"سطر {i}: {str(e)[:30]}")
-        
-        msg = f"✅ تم استيراد {success} سجل"
-        if errors:
-            msg += f"\n\n⚠️ {len(errors)} خطأ:\n" + "\n".join(errors[:10])
-        await u.message.reply_text(msg)
-        
-    except Exception as e:
-        await u.message.reply_text(f"⚠️ خطأ: {str(e)[:100]}")
-
-
-# ============== AI PROCESSING ==============
-async def process(u, c):
+# ============== AI ==============
+async def process(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = u.message.text.strip()
     today = datetime.now().strftime("%Y-%m-%d")
-    
     if len(msg) < 3:
         await u.message.reply_text("ارسل وصف اوضح")
         return
     if not re.search(r'\d+', msg):
         await u.message.reply_text("❌ بدون مبلغ\nمثال: قهوة 18")
         return
-    
     await u.message.reply_text("🔄 جاري التسجيل...")
     accounts = get_accounts()
     accounts_text = "\n".join([f"- {name} ({atype})" for name, atype in accounts])
-    
     try:
         r = ai.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
-            system=f'''Saudi personal accounting with DOUBLE-ENTRY.
+            system=f'''Saudi personal accounting DOUBLE-ENTRY.
 TODAY: {today}
-
-ACCOUNTS:
-{accounts_text}
-
-RULES:
-- Assets ↑ DEBIT | Liabilities ↑ CREDIT
-- Income = CREDIT | Expense = DEBIT
-
+ACCOUNTS:\n{accounts_text}
+RULES: Assets/Expense=DEBIT normal. Liability/Income/Equity=CREDIT normal.
 PATTERNS:
-1. Expense small (<500): debit=expense, credit=نقد
-2. Expense large (>500): debit=expense, credit=بنك
-3. Salary: debit=بنك, credit=راتب
-4. Buy asset: debit=asset, credit=نقد or بنك
-5. Loan: debit=نقد, credit=قرض
-6. Pay loan: debit=قرض, credit=نقد
-
+1. Small expense (<500): debit=expense, credit=نقد
+2. Large expense (>500): debit=expense, credit=بنك
+3. Income: debit=بنك, credit=income_account
+4. Buy asset: debit=asset, credit=بنك
+5. Loan received: debit=بنك, credit=قرض
+6. Loan payment: debit=قرض, credit=بنك
 Reply ONLY JSON:
 Transaction: {{"description":"وصف","debit_account":"name","credit_account":"name","amount":number}}
 Unclear: {{"needs_clarification":true,"reason":"السبب"}}
 Not transaction: {{"not_transaction":true,"reply":"رد"}}
-
 Use EXACT account names.''',
             messages=[{"role": "user", "content": msg}]
         )
         raw = r.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         d = json.loads(raw)
-        
         if d.get("not_transaction"):
             await u.message.reply_text(d.get("reply", "مو معاملة"))
             return
@@ -536,7 +562,6 @@ Use EXACT account names.''',
         if not account_exists(d["debit_account"]) or not account_exists(d["credit_account"]):
             await u.message.reply_text(f"⚠️ حساب غير موجود\nمدين: {d['debit_account']}\nدائن: {d['credit_account']}")
             return
-        
         entry_id = post_entry(today, d["description"], d["debit_account"], d["credit_account"], d["amount"])
         await u.message.reply_text(
             f"✅ #{entry_id}\n━━━━━━━━━━━━━━━\n"
@@ -552,8 +577,12 @@ Use EXACT account names.''',
 
 def main():
     init()
-    print("Bot running with volume support!")
+    print("Bot running with daily backup!")
     app = Application.builder().token(TOKEN).build()
+
+    # Daily backup at 9 PM Riyadh time (UTC+3 = 18:00 UTC)
+    app.job_queue.run_daily(daily_backup_job, time=time(hour=18, minute=0))
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
@@ -561,12 +590,13 @@ def main():
     app.add_handler(CommandHandler("income", cmd_income))
     app.add_handler(CommandHandler("networth", cmd_networth))
     app.add_handler(CommandHandler("last10", cmd_last10))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("opening", cmd_opening))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("addaccount", cmd_addaccount))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process))
     app.run_polling()

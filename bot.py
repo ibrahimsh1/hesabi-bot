@@ -76,7 +76,7 @@ def post_entry(date, desc, debit_acc, credit_acc, amount):
     c = sqlite3.connect(DB)
     c.execute("INSERT INTO journal (date, description, debit_account, credit_account, amount) VALUES (?, ?, ?, ?, ?)",
               (date, desc, debit_acc, credit_acc, amount))
-    last_id = c.lastrowid
+    last_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     c.commit()
     c.close()
     return last_id
